@@ -1,0 +1,135 @@
+name: Build provider plugins
+
+# Compiles the PRIVATE provider plugins (Nuitka) on this PUBLIC repo's free
+# runner minutes.  The monorepo source is checked out READ-ONLY via a
+# fine-grained token (MONOREPO_READ_TOKEN).  Each compiled package is
+# ENCRYPTED with artifact-pub.pem before it touches any publicly readable
+# channel; only the monorepo (holding the private key) can decrypt, sign and
+# publish.  See README.md for the security model.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Plugin version (semver). Empty = date+sha."
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # create the release carrying the encrypted assets
+
+jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout monorepo (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: StitchWB/Stitch-Account-Manager
+          token: ${{ secrets.MONOREPO_READ_TOKEN }}
+          path: monorepo
+
+      - name: Determine version
+        id: version
+        shell: python
+        run: |
+          import os, subprocess, datetime
+          inp = "${{ github.event.inputs.version }}".strip()
+          if not inp:
+              sha = subprocess.check_output(
+                  ["git", "rev-parse", "--short", "HEAD"], cwd="monorepo"
+              ).decode().strip()
+              n = datetime.date.today()
+              inp = f"{n.year}.{n.month}.{n.day}+{sha}"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={inp}\n")
+          print("version:", inp)
+
+  compile:
+    name: Compile ${{ matrix.provider }} (${{ matrix.platform }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        provider: [kiro, kiro_v2, windsurf, trae, fireworks, qoder, v0_app]
+        os: [windows-latest, ubuntu-latest]
+        include:
+          - os: windows-latest
+            platform: win_x86_64
+          - os: ubuntu-latest
+            platform: linux_x86_64
+      fail-fast: false
+    steps:
+      - name: Checkout stitch-build (public key)
+        uses: actions/checkout@v4
+
+      - name: Checkout monorepo (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: StitchWB/Stitch-Account-Manager
+          token: ${{ secrets.MONOREPO_READ_TOKEN }}
+          path: monorepo
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Activate MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install dependencies
+        working-directory: monorepo
+        run: |
+          pip install -e python/
+          pip install nuitka
+
+      - name: Build + encrypt
+        shell: bash
+        env:
+          PROVIDER: ${{ matrix.provider }}
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          python monorepo/scripts/build_encrypted_plugin.py \
+            --provider "$PROVIDER" \
+            --version "$VERSION" \
+            --providers-root monorepo/python/autoreg/providers \
+            --pubkey artifact-pub.pem \
+            --out "${PROVIDER}-${PLATFORM}.zip.enc"
+
+      - name: Upload encrypted artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: enc-${{ matrix.provider }}-${{ matrix.platform }}
+          path: '*.zip.enc'
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish encrypted release
+    needs: [version, compile]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all encrypted artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: enc-artifacts
+          pattern: enc-*
+          merge-multiple: true
+
+      - name: Create release + upload encrypted assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: plugins-${{ needs.version.outputs.version }}
+          name: Compiled provider plugins ${{ needs.version.outputs.version }}
+          body: |
+            Encrypted compiled provider plugins (Nuitka).  Assets are encrypted
+            with the artifact public key; only the private monorepo can decrypt,
+            sign and publish them.  Do not use these assets directly.
+          files: enc-artifacts/*.zip.enc
+          make_latest: false
