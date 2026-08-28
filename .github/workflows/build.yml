@@ -92,9 +92,13 @@ jobs:
         shell: bash
         env:
           PROVIDER: ${{ matrix.provider }}
-          PLATFORM: ${{ matrix.platform }}
+          RUNNER_OS_NAME: ${{ runner.os }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
+          # Derive the platform tag from runner.os (reliable) rather than the
+          # matrix include, so the encrypted asset name always carries the
+          # platform suffix the consumer expects (<provider>-<platform>.zip.enc).
+          if [ "$RUNNER_OS_NAME" = "Windows" ]; then PLATFORM=win_x86_64; else PLATFORM=linux_x86_64; fi
           python monorepo/scripts/build_encrypted_plugin.py \
             --provider "$PROVIDER" \
             --version "$VERSION" \
